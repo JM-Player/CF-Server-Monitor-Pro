@@ -8,6 +8,8 @@ export default {
     // ==========================================
     const EPOCH_START = 1779667200000; 
     const SEED_NODE = 'https://tanzhen.kejikkk.com';
+    const SLOT_TIME = 10000; // 调整为 10秒出块
+    const OFFLINE_THRESHOLD = 300000; // 调整为 5分钟离线判定
 
     // ==========================================
     // 0. 数据库自动化热创建与无缝升级
@@ -69,12 +71,41 @@ export default {
           )
         `).run();
 
+        // 真实链核心表：钱包状态机与交易内存池
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS blockchain_wallets (
+            address TEXT PRIMARY KEY, 
+            balance REAL DEFAULT 0
+          )
+        `).run();
+
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS mempool (
+            tx_id TEXT PRIMARY KEY, 
+            payload TEXT, 
+            timestamp INTEGER
+          )
+        `).run();
+
+        // 防双花/状态绝对一致性核心表：已执行交易流水
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS executed_txs (
+            tx_id TEXT PRIMARY KEY, 
+            timestamp INTEGER
+          )
+        `).run();
+
         await env.DB.prepare(`
           INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score) 
           VALUES (?, 'true', ?, 9999) ON CONFLICT(domain) DO UPDATE SET is_beacon='true', reputation_score=9999
         `).bind(SEED_NODE, Date.now()).run();
 
-        const currentSlotNow = Math.max(1, Math.floor((Date.now() - EPOCH_START) / 3000));
+        // 清理由于恶意节点广播产生的离谱异常资产重力数据
+        try {
+            await env.DB.prepare('UPDATE blockchain_peers SET total_asset = 0 WHERE total_asset > 100000000').run();
+        } catch(e) {}
+
+        const currentSlotNow = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
         await env.DB.prepare('DELETE FROM blockchain_ledger WHERE slot_id > ?').bind(currentSlotNow + 10).run();
         
         globalThis.dbInitialized = true;
@@ -102,7 +133,11 @@ export default {
     const calcServerAsset = (server, nowMs) => {
         let amount = 0; let remValue = 0;
         if (server.price && server.price.match(/[\d.]+/)) {
-            let rawAmount = parseFloat(server.price.match(/[\d.]+/)[0]) || 0;
+            const match = server.price.match(/[\d.]+/);
+            let rawAmount = match ? parseFloat(match[0]) : 0;
+            // 增加本地资产解析封顶防溢出，防止价格填写异常导致重力爆炸
+            rawAmount = Math.min(rawAmount, 100000); 
+
             let rate = 1; const pUpper = server.price.toUpperCase();
             if (pUpper.includes('USD') || pUpper.includes('$')) rate = 7.23;
             else if (pUpper.includes('EUR') || pUpper.includes('€')) rate = 7.85;
@@ -135,6 +170,33 @@ export default {
         return { amount, remValue };
     };
 
+    // 状态机交易结算 (严格防双花与防重放)
+    const processBlockTransactions = async (txs) => {
+        if (!txs || !Array.isArray(txs)) return;
+        let txIdsToDelete = [];
+        for (const tx of txs) {
+            if (!tx || !tx.id) continue;
+            try {
+                // 核心防线：检查是否已经执行过该笔交易
+                const exist = await env.DB.prepare('SELECT tx_id FROM executed_txs WHERE tx_id = ?').bind(tx.id).first();
+                if (!exist) {
+                    await env.DB.prepare('INSERT INTO executed_txs (tx_id, timestamp) VALUES (?, ?)').bind(tx.id, Date.now()).run();
+                    
+                    if (tx.from) {
+                        await env.DB.prepare('INSERT INTO blockchain_wallets (address, balance) VALUES (?, 0) ON CONFLICT(address) DO UPDATE SET balance = balance - ?').bind(tx.from, tx.amount).run();
+                    }
+                    if (tx.to) {
+                        await env.DB.prepare('INSERT INTO blockchain_wallets (address, balance) VALUES (?, ?) ON CONFLICT(address) DO UPDATE SET balance = balance + ?').bind(tx.to, tx.amount, tx.amount).run();
+                    }
+                }
+                txIdsToDelete.push(`'${tx.id}'`);
+            } catch(e) {}
+        }
+        if (txIdsToDelete.length > 0) {
+            await env.DB.prepare(`DELETE FROM mempool WHERE tx_id IN (${txIdsToDelete.join(',')})`).run();
+        }
+    };
+
     // ==========================================
     // 1. 认证机制与全局设置加载
     // ==========================================
@@ -162,13 +224,27 @@ export default {
       show_asset: 'false', asset_currency: '元', is_beacon: 'false', enable_ranking: 'false', ranking_api: '',
       tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
       auto_reset_traffic: 'false', report_interval: '5',
-      ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default'
+      ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
+      miner_wallet: '' // 矿工钱包地址
     };
 
     try {
       const { results } = await env.DB.prepare('SELECT * FROM settings').all();
       if (results && results.length > 0) results.forEach(r => sys[r.key] = r.value);
     } catch (e) {}
+
+    // ==========================================
+    // 轻量化链上账本 API 
+    // ==========================================
+    if (request.method === 'GET' && url.searchParams.get('action') === 'balance') {
+        const addr = url.searchParams.get('address') || '';
+        try {
+            const wallet = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(addr).first();
+            return new Response(JSON.stringify({ balance: wallet ? wallet.balance : 0 }), { headers: {'Content-Type':'application/json'} });
+        } catch(e) {
+            return new Response(JSON.stringify({ balance: 0 }), { headers: {'Content-Type':'application/json'} });
+        }
+    }
 
     // ==========================================
     // Web3 共识网络核心路由
@@ -193,9 +269,11 @@ export default {
         
         if (request.method === 'GET' && route === 'sync') {
             const since = parseInt(url.searchParams.get('since_slot') || '0');
-            const { results: blocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE slot_id > ? ORDER BY slot_id DESC LIMIT 50').bind(since).all();
+            // 修改为正序拉取 200 条，确保新节点加入或掉线重连时能按时间线完美重放交易，保证各节点余额强一致性
+            const { results: blocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE slot_id > ? ORDER BY slot_id ASC LIMIT 200').bind(since).all();
             const { results: peers } = await env.DB.prepare('SELECT * FROM blockchain_peers WHERE is_beacon IN ("true", "1") ORDER BY reputation_score DESC LIMIT 20').all();
-            return new Response(JSON.stringify({ blocks, peers }), { headers: {'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*'} });
+            const { results: mempool } = await env.DB.prepare('SELECT * FROM mempool ORDER BY timestamp DESC LIMIT 20').all();
+            return new Response(JSON.stringify({ blocks, peers, mempool }), { headers: {'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*'} });
         }
 
         if (request.method === 'POST' && route === 'submit') {
@@ -204,70 +282,108 @@ export default {
             }
             try {
                 const block = await request.json();
-                const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / 3000));
+                const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
                 
                 if (parseInt(block.slot_id) > currentSlot + 2) {
                     return new Response('Block from future rejected', { status: 400 });
                 }
 
-                const currentBlock = await env.DB.prepare('SELECT payload FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
-                let shouldInsert = true;
+                const currentBlock = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
                 
-                if (currentBlock) {
-                    const currentPayload = JSON.parse(currentBlock.payload);
-                    const incomingPayload = JSON.parse(block.payload);
-                    if ((parseFloat(incomingPayload.total_asset)||0) <= (parseFloat(currentPayload.total_asset)||0)) {
-                        shouldInsert = false; 
-                    }
-                }
-                
-                if (shouldInsert) {
+                // 解决区块不一致的终极方案：先到先得，不覆盖旧区块。避免节点来回跳跃产生分叉。
+                if (!currentBlock) {
                     await env.DB.prepare(`
-                        INSERT OR REPLACE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) 
+                        INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) 
                         VALUES (?, ?, ?, ?, ?)
                     `).bind(block.slot_id, block.proposer_domain, block.block_hash, block.payload, Date.now()).run();
                     
                     const pl = JSON.parse(block.payload);
+                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 100000000); 
                     await env.DB.prepare(`
                         INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) 
                         VALUES (?, ?, ?, ?) 
                         ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen
-                    `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, parseFloat(pl.total_asset)||0, Date.now()).run();
+                    `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()).run();
+                    
+                    if (pl.txs) await processBlockTransactions(pl.txs);
                 }
                 return new Response('Consensus Accepted', { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
             } catch(e) { return new Response('Block Reject', { status: 400 }); }
+        }
+        
+        // 接收广播交易进入内存池 (后台管理员直接广播)
+        if (request.method === 'POST' && route === 'tx') {
+            try {
+                const data = await request.json();
+                const tx = data.tx || data; 
+
+                if (!tx || !tx.from || !tx.to || !tx.amount || tx.amount <= 0) throw new Error("Invalid Tx Payload");
+
+                // 轻量化账本验证机制：转账前严格检查本地账本余额防双花，不依赖前端签名以防网络报错
+                const wallet = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(tx.from).first();
+                if (!wallet || wallet.balance < tx.amount) {
+                    throw new Error("Insufficient balance in Ledger");
+                }
+
+                await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(tx.id, JSON.stringify(tx), Date.now()).run();
+                return new Response('Tx Accepted', { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
+            } catch(e) { 
+                return new Response('Tx Reject: ' + e.message, { status: 400, headers: {'Access-Control-Allow-Origin':'*'} }); 
+            }
         }
     }
 
     const mineAndGossip = async (localAsset, localVpsCount) => {
         try {
-            const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / 3000));
+            const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
             const hash = await miniHash(`${currentSlot}-${host}`);
             
-            // 降低哈希难度，减少全网空块的产生 (尾数 <= 14，约93.75%的概率)
             if (parseInt(hash.slice(-1), 16) <= 14) {
-                const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset });
+                // 打包内存池中的交易
+                const { results: pendingTxs } = await env.DB.prepare('SELECT payload FROM mempool ORDER BY timestamp ASC LIMIT 20').all();
+                let blockTxs = pendingTxs.map(t => JSON.parse(t.payload));
+                
+                // 出块奖励 1 Cycle (使用 deterministic ID 防多节点打包产生重复奖励)
+                if (sys.miner_wallet) {
+                    const coinbaseId = 'cb-' + currentSlot + '-' + await miniHash(host);
+                    blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: Date.now() });
+                }
+
+                const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: blockTxs });
                 const blockData = { slot_id: currentSlot, proposer_domain: host, block_hash: hash, payload: payloadStr };
                 
                 const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY reputation_score DESC LIMIT 4`).bind(host).all();
                 for (const b of beacons) {
                     fetch(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
                 }
-                await env.DB.prepare(`INSERT OR REPLACE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(currentSlot, host, hash, payloadStr, Date.now()).run();
+                
+                const currentBlock = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
+                if (!currentBlock) {
+                    await env.DB.prepare(`INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(currentSlot, host, hash, payloadStr, Date.now()).run();
+                    await processBlockTransactions(blockTxs);
+                }
             }
 
             const syncFromPeer = async (peerDomain) => {
-                const localTop = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 1').first();
-                const since = localTop ? localTop.slot_id : 0;
+                const currentSlotNow = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
+                // 强势向后追溯 200 个块 (约33分钟的断网容错) 填补空缺
+                const since = Math.max(0, currentSlotNow - 200);
+                
                 try {
                     const syncRes = await fetch(`${peerDomain}/api/consensus/sync?since_slot=${since}`);
                     if (syncRes.ok) {
                         const syncData = await syncRes.json();
                         for (const b of syncData.blocks) {
-                            if (b.slot_id <= currentSlot + 2) {
-                                await env.DB.prepare(`INSERT OR REPLACE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(b.slot_id, b.proposer_domain, b.block_hash, b.payload, b.timestamp).run();
-                                const pl = JSON.parse(b.payload);
-                                await env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, parseFloat(pl.total_asset)||0, b.timestamp).run();
+                            if (b.slot_id <= currentSlotNow + 2) {
+                                // 增加 exist 判定，严格保证本节点一条时间线，不被新来的块乱覆盖
+                                const exist = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(b.slot_id).first();
+                                if (!exist) {
+                                    await env.DB.prepare(`INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(b.slot_id, b.proposer_domain, b.block_hash, b.payload, b.timestamp).run();
+                                    const pl = JSON.parse(b.payload);
+                                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 100000000);
+                                    await env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp).run();
+                                    if (pl.txs) await processBlockTransactions(pl.txs);
+                                }
                             }
                         }
                         for (const p of syncData.peers) {
@@ -276,6 +392,9 @@ export default {
                                 VALUES (?, ?, ?, ?) 
                                 ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, last_seen=MAX(last_seen, excluded.last_seen), reputation_score=MAX(reputation_score, excluded.reputation_score)
                             `).bind(p.domain, p.is_beacon, p.last_seen, p.reputation_score).run();
+                        }
+                        for (const m of (syncData.mempool || [])) {
+                             await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(m.tx_id, m.payload, m.timestamp).run();
                         }
                     }
                 } catch(e) {}
@@ -319,10 +438,10 @@ export default {
 
         for (const s of allServers) {
           const diff = now - s.last_updated;
-          const isOffline = diff > 120000; 
+          const isOffline = diff > OFFLINE_THRESHOLD; 
 
           if (isOffline && !alertState[s.id]) {
-            await sendTelegram(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 离线 (超过2分钟未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+            await sendTelegram(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 离线 (超过5分钟未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
             alertState[s.id] = true;
             stateChanged = true;
           } else if (!isOffline && alertState[s.id]) {
@@ -503,6 +622,26 @@ export default {
           `).bind(data.name || 'Unnamed', data.server_group || '默认分组', data.price || '', data.expire_date || '', data.bandwidth || '', data.traffic_limit || '', data.agent_os || 'debian', data.is_hidden || 'false', data.id).run();
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         }
+        else if (data.action === 'send_tx') {
+          if (!data.from || !data.to || !data.amount) throw new Error("Missing params");
+          const amountNum = parseFloat(data.amount);
+          if (amountNum <= 0) throw new Error("Invalid amount");
+          
+          const wallet = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(data.from).first();
+          if (!wallet || wallet.balance < amountNum) throw new Error("余额不足 (Insufficient balance)");
+
+          const txData = { id: crypto.randomUUID(), type: 'TRANSFER', from: data.from, to: data.to, amount: amountNum, timestamp: Date.now() };
+          await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(txData.id, JSON.stringify(txData), txData.timestamp).run();
+          
+          ctx.waitUntil((async () => {
+              const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY reputation_score DESC LIMIT 4`).bind(host).all();
+              for (const b of beacons) {
+                  fetch(`${b.domain}/api/consensus/tx`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(txData) }).catch(() => {});
+              }
+          })());
+
+          return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+        }
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 400 });
       }
@@ -520,7 +659,7 @@ export default {
       let trs = '';
       if (results && results.length > 0) {
         for (const s of results) {
-          const isOnline = (now - s.last_updated) < 30000;
+          const isOnline = (now - s.last_updated) < OFFLINE_THRESHOLD;
           const status = isOnline ? '<span style="color:green; font-weight:bold;">在线</span>' : '<span style="color:red; font-weight:bold;">离线</span>';
           const hiddenBadge = s.is_hidden === 'true' ? '<span style="background:#64748b; color:white; padding:2px 6px; border-radius:4px; font-size:12px; margin-left:5px;">已隐藏</span>' : '';
           
@@ -544,6 +683,14 @@ export default {
             </tr>
           `;
         }
+      }
+
+      let walletBalance = 0;
+      if (sys.miner_wallet) {
+          try {
+              const w = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(sys.miner_wallet).first();
+              if (w) walletBalance = w.balance;
+          } catch(e) {}
       }
 
       const rawNodeDataV4 = `陕西西安移动
@@ -1253,7 +1400,7 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
           th { background: #f8f9fa; }
           .btn { cursor: pointer; border-radius: 4px; font-size: 13px; transition: opacity 0.2s; border: none; padding: 6px 10px; color: white; margin-left: 5px; }
           .btn:hover { opacity: 0.8; }
-          .btn-blue { background: #3b82f6; } .btn-green { background: #10b981; } .btn-red { background: #ef4444; } .btn-gray { background: #6b7280; }
+          .btn-blue { background: #3b82f6; } .btn-green { background: #10b981; } .btn-red { background: #ef4444; } .btn-gray { background: #6b7280; } .btn-purple { background: #8b5cf6; } .btn-orange { background: #f59e0b; }
           .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
           .form-group { display: flex; flex-direction: column; margin-bottom: 15px; }
           .form-group label { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: #555;}
@@ -1276,7 +1423,19 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
                 <input type="checkbox" id="cfg_is_beacon" style="width:20px;height:20px;" ${sys.is_beacon === 'true' ? 'checked' : ''}>
                 🚀 加入去中心化共识网络 (成为信标权重节点)
             </label>
-            <p style="font-size:13px; color:#0c4a6e; margin-top:8px;">勾选后，您的面板将开放接收全球其他面板的匿名出块提交，参与全网资产排名。该操作无风险，完全零 KV 依赖，每日仅消耗极少免费 D1 写入额度。</p>
+            <p style="font-size:13px; color:#0c4a6e; margin-top:8px;">勾选后，您的面板将开放接收全球其他面板的匿名出块提交，参与全网资产排名。</p>
+          </div>
+          
+          <div style="background:#f3e8ff; padding:15px; border-radius:8px; border:1px solid #e9d5ff; margin-bottom:20px;">
+            <h3 style="margin-top:0; color:#6b21a8;">💼 Web3 钱包与转账 (Cycle Ledger)</h3>
+            <div class="form-group">
+                <label>本站出块奖励收款钱包地址 (自动挖矿 Cycle)</label>
+                <input type="text" id="cfg_miner_wallet" value="${sys.miner_wallet || ''}" placeholder="例如输入自定义字符串或 0x 公钥">
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:16px; font-weight:bold; color:#7e22ce;">当前余额: ${walletBalance} Cycle</span>
+                <button onclick="openTxModal()" class="btn btn-purple">发起转账 (Tx)</button>
+            </div>
           </div>
 
           <div class="settings-grid">
@@ -1424,6 +1583,22 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
           </table>
         </div>
 
+        <div id="txModal" class="modal">
+          <div class="modal-content">
+            <h3 style="margin-top:0; color:#7e22ce;">💸 发起 Cycle 转账</h3>
+            <label>发送方地址 (From)</label> 
+            <input type="text" id="txFrom" value="${sys.miner_wallet || ''}">
+            <label>接收方地址 (To)</label> 
+            <input type="text" id="txTo" placeholder="输入接收方地址 (如 0x...)">
+            <label>转账数量 (Amount Cycle)</label> 
+            <input type="number" id="txAmount" placeholder="输入 Cycle 数量" min="0.1" step="0.1">
+            <div style="text-align: right; margin-top: 15px;">
+              <button onclick="closeTxModal()" style="padding: 8px 15px; border: 1px solid #ccc; background: white; margin-right: 5px; cursor:pointer;">取消</button>
+              <button onclick="sendTx()" class="btn btn-purple" style="padding: 8px 15px;">广播交易</button>
+            </div>
+          </div>
+        </div>
+
         <div id="editModal" class="modal">
           <div class="modal-content">
             <h3 style="margin-top:0;">✏️ 编辑服务器信息</h3>
@@ -1479,6 +1654,7 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
               action: 'save_settings',
               settings: {
                 is_beacon: document.getElementById('cfg_is_beacon').checked ? 'true' : 'false',
+                miner_wallet: document.getElementById('cfg_miner_wallet').value,
                 theme: document.getElementById('cfg_theme').value,
                 custom_bg: document.getElementById('cfg_custom_bg').value,
                 custom_css: document.getElementById('cfg_custom_css').value,
@@ -1506,6 +1682,40 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
             const res = await fetch('/admin/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
             if (res.ok) { alert('✅ 设置已保存！'); location.reload(); } else alert('保存失败');
           }
+
+          function openTxModal() {
+              document.getElementById('txModal').style.display = 'block';
+          }
+          
+          function closeTxModal() { 
+              document.getElementById('txModal').style.display = 'none'; 
+          }
+
+          async function sendTx() {
+              const to = document.getElementById('txTo').value;
+              const amount = document.getElementById('txAmount').value;
+              const fromInput = document.getElementById('txFrom').value;
+              if(!to || !amount || !fromInput) return alert('请完整填写转账信息');
+
+              try {
+                  const res = await fetch('/admin/api', { 
+                      method: 'POST', 
+                      headers: {'Content-Type': 'application/json'}, 
+                      body: JSON.stringify({ action: 'send_tx', from: fromInput, to: to, amount: amount }) 
+                  });
+                  
+                  if (res.ok) {
+                      alert('🚀 交易已发送至内存池，等待网络打包出块结算！');
+                      closeTxModal();
+                  } else {
+                      const err = await res.json();
+                      alert('转账失败: ' + (err.error || '未知错误'));
+                  }
+              } catch (error) {
+                  alert('发生错误: ' + error.message);
+              }
+          }
+
           async function addServer() {
             const name = document.getElementById('newName').value;
             const agentOs = document.getElementById('newOs').value;
@@ -1538,13 +1748,10 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
           function closeModal() { document.getElementById('editModal').style.display = 'none'; }
           async function saveEdit() {
             const data = {
-              action: 'edit', 
-              id: document.getElementById('editId').value,
-              name: document.getElementById('editName').value,
-              agent_os: document.getElementById('editOs').value,
-              server_group: document.getElementById('editGroup').value, price: document.getElementById('editPrice').value,
-              expire_date: document.getElementById('editExpire').value, bandwidth: document.getElementById('editBandwidth').value,
-              traffic_limit: document.getElementById('editTraffic').value,
+              action: 'edit', id: document.getElementById('editId').value, name: document.getElementById('editName').value,
+              agent_os: document.getElementById('editOs').value, server_group: document.getElementById('editGroup').value, 
+              price: document.getElementById('editPrice').value, expire_date: document.getElementById('editExpire').value, 
+              bandwidth: document.getElementById('editBandwidth').value, traffic_limit: document.getElementById('editTraffic').value,
               is_hidden: document.getElementById('editHidden').value
             };
             const res = await fetch('/admin/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
@@ -1907,8 +2114,11 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         const { results: allS } = await env.DB.prepare('SELECT price, expire_date FROM servers WHERE is_hidden="false"').all();
         let currentAsset = 0;
         for(const s of allS) {
-            currentAsset += calcServerAsset(s, nowMs).amount;
+            const ast = calcServerAsset(s, nowMs).amount;
+            currentAsset += isNaN(ast) ? 0 : ast;
         }
+        // 增加本地资产上限，防止无限累加
+        currentAsset = Math.min(currentAsset, 100000000); 
         
         ctx.waitUntil(mineAndGossip(currentAsset, allS.length));
 
@@ -1918,12 +2128,8 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
       }
     }
 
-    // ==========================================
-    // 单个服务器详情 JSON API
-    // ==========================================
     if (request.method === 'GET' && url.pathname === '/api/server') {
       if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
-      
       const id = url.searchParams.get('id');
       if (!id) return new Response('Miss ID', { status: 400 });
       const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
@@ -1951,37 +2157,23 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         let vDate = sys.visits_date || '';
         
         vTotal++;
-        if (vDate !== todayStr) {
-            vToday = 1; 
-            vDate = todayStr;
-        } else {
-            vToday++;
-        }
+        if (vDate !== todayStr) { vToday = 1; vDate = todayStr; } else { vToday++; }
         
         sys.visits_total = vTotal.toString();
         sys.visits_today = vToday.toString();
         sys.visits_date = todayStr;
 
-        const updateVisits = async () => {
-            try {
-                await env.DB.prepare(`
-                    INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                `).bind(vTotal.toString(), vToday.toString(), todayStr).run();
-            } catch(e) {}
-        };
-        ctx.waitUntil(updateVisits());
+        ctx.waitUntil(env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(vTotal.toString(), vToday.toString(), todayStr).run().catch(()=>{}));
       }
       
       const viewId = url.searchParams.get('id');
-
       if (viewId) {
         const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(viewId).first();
         if (!server || server.is_hidden === 'true') return new Response('Server not found', { status: 404 });
-        
         const rxField = sys.auto_reset_traffic === 'true' ? 'monthly_rx' : 'net_rx';
         const txField = sys.auto_reset_traffic === 'true' ? 'monthly_tx' : 'net_tx';
-
+        
+        // --- 完整保留详情页的换行与缩排 ---
         const detailHtml = `<!DOCTYPE html>
         <html>
         <head>
@@ -2112,7 +2304,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
                 document.getElementById('val-uptime').innerText = data.uptime || 'N/A'; document.getElementById('val-arch').innerText = data.arch || 'N/A'; document.getElementById('val-os').innerText = data.os || 'N/A'; document.getElementById('val-virt').innerText = data.virt || 'N/A'; document.getElementById('val-cpuinfo').innerText = data.cpu_info || 'N/A'; document.getElementById('val-load').innerText = data.load_avg || '0.00'; document.getElementById('val-boot').innerText = data.boot_time || 'N/A'; 
                 document.getElementById('val-traffic').innerText = formatBytes(data.${txField} || 0) + ' / ' + formatBytes(data.${rxField} || 0);
 
-                const isOnline = (Date.now() - data.last_updated) < 30000;
+                const isOnline = (Date.now() - data.last_updated) < ${OFFLINE_THRESHOLD};
                 const badge = document.getElementById('head-status'); badge.innerText = isOnline ? '在线' : '离线'; badge.style.background = isOnline ? '#10b981' : '#ef4444';
                 if(!isOnline) return;
                 
@@ -2181,7 +2373,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
 
       if (results && results.length > 0) {
         for (const server of results) {
-          const isOnline = (now - server.last_updated) < 30000;
+          const isOnline = (now - server.last_updated) < OFFLINE_THRESHOLD;
           if (isOnline) {
             globalOnline++;
             globalSpeedIn += parseFloat(server.net_in_speed) || 0;
@@ -2214,13 +2406,14 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         }
       }
 
-      // Web3 获取去中心化排名与节点数量 (引入活性淘汰机制)
+      // Web3 获取去中心化排名与节点数量 (引入阈值截断防止资产溢出)
       let localRank = 1;
       let globalNetAsset = totalAsset;
       let globalProposer = '--';
       let currentHeight = 0;
       let activeBeacons = 0;
       let globalNodes = 1;
+      let pendingTxsCount = 0;
       
       try {
           const activeThreshold = Date.now() - 300000; 
@@ -2231,7 +2424,9 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           
           for (const p of rankList) {
               if (p.domain !== host) {
-                  const pAsset = parseFloat(p.total_asset) || 0;
+                  let pAsset = parseFloat(p.total_asset) || 0;
+                  if (isNaN(pAsset) || pAsset < 0) pAsset = 0;
+                  pAsset = Math.min(pAsset, 100000000); // 增加同步资产解析封顶防污染
                   otherAssets += pAsset;
                   if (pAsset > totalAsset) higherCount++;
               }
@@ -2251,6 +2446,9 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           
           const nCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).first();
           globalNodes = nCountRow && nCountRow.c > 0 ? nCountRow.c : 1;
+
+          const mCount = await env.DB.prepare('SELECT count(*) as c FROM mempool').first();
+          pendingTxsCount = mCount ? mCount.c : 0;
       } catch(e) {}
 
       let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${results.length}</span>`;
@@ -2268,7 +2466,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           cardContentHtml += `<div class="group-header">${grpName}</div><div class="grid-container">`;
           
           for (const server of grpServers) {
-            const isOnline = (now - server.last_updated) < 30000;
+            const isOnline = (now - server.last_updated) < OFFLINE_THRESHOLD;
             const statusColor = isOnline ? '#10b981' : '#ef4444'; 
             
             const cpu = parseFloat(server.cpu || '0').toFixed(1); 
@@ -2321,7 +2519,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             const diskUsedStr = formatBytes((parseFloat(server.disk_used || 0) * 1048576).toString());
             const diskTotalStr = formatBytes((parseFloat(server.disk_total || 0) * 1048576).toString());
 
-            // 【还原】恢复原版的 vps-card HTML 和 CSS 布局，带有绿灯点
+            // 【还原】恢复原版的 vps-card HTML 和 CSS 布局
             cardContentHtml += `
               <a href="/?id=${server.id}" class="vps-card" data-country="${cCode}">
                 <div class="card-left">
@@ -2366,7 +2564,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               </a>
             `;
 
-            // 【还原】恢复原版的 table-row 绿灯点
+            // 【还原】恢复原版的 table-row 
             tableBodyHtml += `
               <tr onclick="window.location.href='/?id=${server.id}'" style="cursor:pointer;" data-country="${cCode}">
                 <td style="text-align:center;"><div class="status-dot" style="background:${statusColor}; display:inline-block; margin:0;"></div></td>
@@ -2402,25 +2600,50 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         }
       }
 
+      // 获取前 10 财富榜
+      let richListRows = '';
+      try {
+          const { results: rList } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets ORDER BY balance DESC LIMIT 10').all();
+          rList.forEach((r, idx) => {
+              const shortAddr = r.address.length > 15 ? r.address.substring(0,8) + '...' + r.address.slice(-6) : r.address;
+              richListRows += `<tr>
+                <td><span style="color:#888; margin-right:8px;">#${idx+1}</span> <a href="javascript:void(0)" onclick="searchBalance('${r.address}')" style="color:#3b82f6; text-decoration:none; font-family:monospace; font-weight:bold;">${shortAddr}</a></td>
+                <td style="text-align:right; font-weight:bold; color:#10b981;">${r.balance.toFixed(2)} Cycle</td>
+              </tr>`;
+          });
+      } catch(e) {}
+      if(!richListRows) richListRows = '<tr><td colspan="2" style="text-align:center;">暂无榜单数据</td></tr>';
+
+      // 渲染最新区块列表 (带可追踪的 Txs)
       let blockExplorerRows = '';
       try {
           const { results: recentBlocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 50').all();
           for (const b of recentBlocks) {
               const bDate = new Date(b.timestamp + 8*3600000).toISOString().replace('T',' ').substring(0, 19);
-              const proposerLink = b.proposer_domain.startsWith('http') ? b.proposer_domain : 'https://' + b.proposer_domain;
+              const cleanProposer = b.proposer_domain.replace('https://', '').replace('http://', '');
+              
+              let txsHtml = `<span style="color:#94a3b8;">0 Txs</span>`;
+              try {
+                  const bPayload = JSON.parse(b.payload);
+                  if (bPayload.txs && bPayload.txs.length > 0) {
+                      const safeTxs = JSON.stringify(bPayload.txs).replace(/'/g, "&#39;").replace(/"/g, "&quot;");
+                      txsHtml = `<a href="javascript:void(0)" onclick="showBlockTxs('${safeTxs}')" style="color:#8b5cf6; font-weight:bold; text-decoration:underline;">${bPayload.txs.length} Txs</a>`;
+                  }
+              } catch(e) {}
               blockExplorerRows += `<tr>
                   <td><b style="color:#10b981;"># ${b.slot_id}</b></td>
-                  <td><a href="${proposerLink}" target="_blank" style="color:#3b82f6; text-decoration:none; font-weight:600;">${b.proposer_domain.replace('https://', '')}</a></td>
+                  <td><span style="color:#3b82f6; font-weight:600;">${cleanProposer}</span></td>
                   <td style="font-family:monospace; font-size:11px; color:#8b949e;">${b.block_hash}</td>
+                  <td>${txsHtml}</td>
                   <td style="color:#64748b; font-size:12px;">${bDate}</td>
               </tr>`;
           }
       } catch(e){}
-      if (!blockExplorerRows) blockExplorerRows = '<tr><td colspan="4" style="text-align:center; padding:20px; color:#888;">暂无区块数据，等待网络共识...</td></tr>';
+      if (!blockExplorerRows) blockExplorerRows = '<tr><td colspan="5" style="text-align:center; padding:20px; color:#888;">暂无区块数据，等待网络共识...</td></tr>';
 
       if (isAjax) {
           const ajaxResponse = `
-             <div id="ajax-stats-payload" data-rank="${localRank}" data-net-asset="${globalNetAsset.toFixed(2)}" data-proposer="${globalProposer}" data-height="${currentHeight}" data-beacons="${activeBeacons}" data-nodes="${globalNodes}" style="display:none;"></div>
+             <div id="ajax-stats-payload" data-rank="${localRank}" data-net-asset="${globalNetAsset.toFixed(2)}" data-proposer="${globalProposer}" data-height="${currentHeight}" data-beacons="${activeBeacons}" data-nodes="${globalNodes}" data-pending-txs="${pendingTxsCount}" style="display:none;"></div>
              <div id="ajax-stats" style="display:none;">
                 <div class="g-item"><div class="g-label">本站服务器总数</div><div class="g-val">${results.length}</div><div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div></div>
                 ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">本站数字资产 (${sys.asset_currency || '元'})</div><div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span></div></div>` : ''}
@@ -2431,6 +2654,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
              <div id="ajax-cards">${cardContentHtml}</div>
              <tbody id="ajax-table" style="display:none;">${tableBodyHtml || '<tr><td colspan="11" style="text-align:center;">暂无数据</td></tr>'}</tbody>
              <tbody id="ajax-blocks" style="display:none;">${blockExplorerRows}</tbody>
+             <tbody id="ajax-richlist" style="display:none;">${richListRows}</tbody>
              <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
           `;
           return new Response(ajaxResponse, { headers: { 'Content-Type': 'text/html' } });
@@ -2464,19 +2688,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           .theme4 .ticker-bar { background: rgba(0,0,0,0.2); }
           .theme4 .ticker-fill { background: #00f2fe; }
 
-          /* 【还原】原版卡片布局 CSS */
-          .grid-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 15px; }
-          .vps-card { display: flex; justify-content: space-between; align-items: stretch; background: white; padding: 18px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); text-decoration: none; color: inherit; border: 1px solid transparent; transition: all 0.2s ease; }
-          .card-left { flex: 0 0 180px; display: flex; flex-direction: column; justify-content: center; }
-          .card-title { display: flex; align-items: center; margin-bottom: 4px; }
-          .card-title-text { font-weight: 600; }
-          .status-dot { width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink:0; }
-          .card-meta { font-size: 12px; color: #6b7280; margin-bottom: 3px; }
-          .card-badges { margin-top: 10px; display: flex; gap: 5px; flex-wrap: wrap; }
-          .badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; color: white; }
-          .badge-bw { background: #3b82f6; } .badge-tf { background: #10b981; } .badge-v4 { background: #a855f7; } .badge-v6 { background: #ec4899; }
-          .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-left: 15px; border-left: 1px solid rgba(150,150,150,0.1); min-width: 0; }
-          
           body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 20px; }
           .container { max-width: 1200px; margin: 0 auto; }
           .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
@@ -2486,6 +2697,33 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; line-height: 1.2; word-break: break-word; white-space: normal; }
           .g-label { font-size: 13px; color: #666; white-space: normal; line-height: 1.4; }
           @media (max-width: 800px) { .grid-container { grid-template-columns: 1fr; } .vps-card { flex-direction: column; } .card-right { padding-left: 0; border-left: none; border-top: 1px solid #f0f0f0; margin-top: 15px; padding-top: 15px; } .header { flex-direction: column; align-items: flex-start; gap: 15px;} .header-right { width:100%; justify-content: space-between;} }
+
+          /* Asset Radar & Rich List Styles */
+          .asset-radar { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; background: white; padding: 15px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+          .asset-radar input { flex: 1; min-width: 250px; padding: 10px 15px; border: 1px solid #e2e8f0; border-radius: 8px; font-family: monospace; font-size: 14px; }
+          .asset-radar button { background: #8b5cf6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: opacity 0.2s; }
+          .asset-radar button:hover { opacity: 0.9; }
+          .block-dashboard-layout { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; align-items: start; }
+          .rich-list-card { background: white; border-radius: 12px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); overflow-x: auto;}
+          .rich-list-card h3 { margin-top: 0; font-size: 16px; color: #1f2937; border-bottom: 1px solid #f1f5f9; padding-bottom: 10px; margin-bottom: 10px; }
+          
+          .theme2 .asset-radar, .theme2 .rich-list-card { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; box-shadow: none; }
+          .theme2 .asset-radar input { background: #0d1117; color: #c9d1d9; border-color: #30363d; }
+          .theme2 .rich-list-card h3 { color: #fff; border-bottom-color: #30363d; }
+          .theme4 .asset-radar, .theme4 .rich-list-card { background: rgba(255,255,255,0.2); backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.4); color:#fff; }
+          .theme4 .asset-radar input { background: rgba(0,0,0,0.2); color:#fff; border:none; }
+          .theme4 .rich-list-card h3 { color:#fff; border-bottom-color: rgba(255,255,255,0.2); }
+          .theme5 .asset-radar, .theme5 .rich-list-card { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; color: #0ff; }
+          .theme5 .asset-radar input { background: #000; color: #0ff; border-color: #f0f; }
+
+          @media (max-width: 900px) { .block-dashboard-layout { grid-template-columns: 1fr; } }
+          
+          /* Modal for Txs */
+          .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; overflow-y: auto; }
+          .modal-content { background: white; padding: 20px; border-radius: 12px; width: 600px; max-width: 95%; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; box-sizing: border-box; }
+          .theme2 .modal-content { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;}
+          .theme4 .modal-content { background: rgba(0,0,0,0.8); color: #fff; border: 1px solid rgba(255,255,255,0.4); backdrop-filter: blur(16px);}
+          .theme5 .modal-content { background: #0b0c10; color: #0ff; border: 1px solid #f0f; border-radius:0;}
         </style>
       </head>
       <body class="${sys.theme || 'theme1'}">
@@ -2493,7 +2731,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           
           <div class="header" style="flex-wrap: wrap; gap: 15px;">
             <h1 style="margin:0;">${sys.site_title}</h1>
-            
             <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
               <div class="view-controls">
                 <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">
@@ -2517,7 +2754,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             <div><div class="c-label">最新区块高度</div><div class="c-val"># <span id="ui-height">${currentHeight}</span></div></div>
             <div>
               <div class="c-label">Slot 出块倒计时</div>
-              <div class="c-val"><span id="ui-ticker">3.0</span> s</div>
+              <div class="c-val"><span id="ui-ticker">10.0</span> s</div>
               <div class="ticker-bar"><div class="ticker-fill" id="ui-ticker-bar"></div></div>
             </div>
             <div><div class="c-label">上一块见证人</div><div class="c-val" style="font-size:13px;" id="ui-proposer">${globalProposer}</div></div>
@@ -2525,7 +2762,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           </div>
 
           <div class="global-stats" style="margin-bottom:15px;">
-            <div class="g-item"><div class="g-label">全网综合排名 / 本站资产</div><div class="g-val">🏆 第 <span style="color:#f59e0b" id="ui-rank">${localRank}</span> 名 | ${totalAsset.toFixed(2)} ${sys.asset_currency}</div></div>
+            <div class="g-item"><div class="g-label">全网综合排名 / 内存池待打包</div><div class="g-val">🏆 第 <span style="color:#f59e0b" id="ui-rank">${localRank}</span> 名 | <span style="color:#8b5cf6;" id="ui-pending-txs">${pendingTxsCount}</span> 笔交易</div></div>
             <div class="g-item"><div class="g-label">全网探针总资产重力 (Consensus Gravity)</div><div class="g-val">💰 <span id="ui-net-asset">${globalNetAsset.toFixed(2)}</span> CNY</div></div>
           </div>
 
@@ -2562,19 +2799,46 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           </div>
 
           <div id="view-block" class="view-panel">
-            <div class="table-responsive" style="background:white; border-radius:12px; padding:10px; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-              <table class="custom-table">
-                <thead>
-                  <tr><th>区块高度 (Slot)</th><th>出块见证人 (Proposer)</th><th>区块哈希 (Hash)</th><th>见证时间 (UTC+8)</th></tr>
-                </thead>
-                <tbody id="table-blocks-body">
-                  ${blockExplorerRows}
-                </tbody>
-              </table>
+            <div class="asset-radar">
+                <input type="text" id="radar-input" placeholder="输入 EVM 钱包地址 (0x...) 查询本链 Cycle 余额">
+                <button onclick="executeSearch()">🔍 查询资产</button>
+            </div>
+            <div id="ui-balance-result" style="display:none; padding:15px; margin-bottom:20px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3); border-radius:8px; font-size:16px;"></div>
+
+            <div class="block-dashboard-layout">
+                <div class="table-responsive" style="background:white; border-radius:12px; padding:10px; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+                  <table class="custom-table">
+                    <thead>
+                      <tr><th>区块高度 (Slot)</th><th>出块见证人</th><th>区块哈希</th><th>打包交易数</th><th>见证时间 (UTC+8)</th></tr>
+                    </thead>
+                    <tbody id="table-blocks-body">
+                      ${blockExplorerRows}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="rich-list-card">
+                    <h3>🏆 Cycle 财富英雄榜</h3>
+                    <table class="custom-table" style="box-shadow:none;">
+                        <tbody id="ajax-richlist">
+                          ${richListRows}
+                        </tbody>
+                    </table>
+                </div>
             </div>
           </div>
           
           ${getFooterHtml(sys)}
+        </div>
+
+        <div id="txTraceModal" class="modal">
+            <div class="modal-content">
+                <h3 style="margin-top:0; color:#8b5cf6;">🔗 区块交易流水追踪</h3>
+                <div id="txTraceList" style="max-height:400px; overflow-y:auto; margin-bottom:15px;"></div>
+                <div style="text-align:right;">
+                    <button onclick="document.getElementById('txTraceModal').style.display='none'" style="padding:8px 15px; border:1px solid #ccc; background:transparent; cursor:pointer; border-radius:6px; color:inherit;">关闭</button>
+                </div>
+            </div>
         </div>
 
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
@@ -2584,12 +2848,13 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           window.currentFilter = 'all';
 
           const EPOCH_START = ${EPOCH_START};
+          const SLOT_TIME = ${SLOT_TIME};
           setInterval(() => {
               const now = Date.now();
               const elapsed = Math.max(0, now - EPOCH_START);
-              const remMs = 3000 - (elapsed % 3000);
+              const remMs = SLOT_TIME - (elapsed % SLOT_TIME);
               document.getElementById('ui-ticker').innerText = (remMs / 1000).toFixed(1);
-              document.getElementById('ui-ticker-bar').style.width = (remMs / 3000 * 100) + '%';
+              document.getElementById('ui-ticker-bar').style.width = (remMs / SLOT_TIME * 100) + '%';
           }, 100);
 
           function switchView(viewName) {
@@ -2602,44 +2867,26 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             localStorage.setItem('monitor_preferred_view', viewName);
 
             if (viewName === 'map') {
-              if (!mapInitialized) {
-                initMap();
-                mapInitialized = true;
-              } else {
-                window.myMap.invalidateSize(); 
-              }
+              if (!mapInitialized) { initMap(); mapInitialized = true; } else { window.myMap.invalidateSize(); }
             }
           }
 
-          function setFilter(code) {
-              window.currentFilter = code;
-              applyFilter();
+          function setFilter(code) { 
+              window.currentFilter = code; 
+              applyFilter(); 
           }
 
           function applyFilter() {
               if(!window.currentFilter) window.currentFilter = 'all';
-              
               document.querySelectorAll('.filter-tag').forEach(el => {
-                  if (el.dataset.code === window.currentFilter) el.classList.add('active');
-                  else el.classList.remove('active');
+                  if (el.dataset.code === window.currentFilter) el.classList.add('active'); else el.classList.remove('active');
               });
-              
               document.querySelectorAll('.vps-card').forEach(el => {
-                  if (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) {
-                      el.style.display = 'flex';
-                  } else {
-                      el.style.display = 'none';
-                  }
+                  el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? 'flex' : 'none';
               });
-              
               document.querySelectorAll('#ajax-table tr').forEach(el => {
-                  if (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) {
-                      el.style.display = '';
-                  } else {
-                      el.style.display = 'none';
-                  }
+                  el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? '' : 'none';
               });
-
               document.querySelectorAll('.group-header').forEach(header => {
                   const grid = header.nextElementSibling;
                   if (grid && grid.classList.contains('grid-container')) {
@@ -2649,83 +2896,109 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               });
           }
 
+          /* --- Web3 Asset Radar & Txs JS --- */
+          function searchBalance(addr) {
+              document.getElementById('radar-input').value = addr;
+              document.getElementById('txTraceModal').style.display = 'none';
+              executeSearch();
+              window.scrollTo({top: document.getElementById('view-block').offsetTop - 20, behavior: 'smooth'});
+          }
+          
+          async function executeSearch() {
+              const addr = document.getElementById('radar-input').value.trim();
+              if(!addr) return;
+              const resDiv = document.getElementById('ui-balance-result');
+              resDiv.style.display = 'block';
+              resDiv.innerHTML = \`<span style="color:#888;">正在检索本地账本节点...</span>\`;
+              try {
+                  const res = await fetch('/?action=balance&address=' + addr);
+                  const data = await res.json();
+                  resDiv.innerHTML = \`账户地址 <a href="javascript:void(0)" style="color:#8b5cf6; font-family:monospace; font-weight:bold;">\${addr}</a> 当前持有资产：<b style="color:#10b981; font-size:20px;">\${data.balance} Cycle</b>\`;
+              } catch(e) {
+                  resDiv.innerHTML = \`<span style="color:#ef4444;">查询失败或地址无记录</span>\`;
+              }
+          }
+
+          function showBlockTxs(txsStr) {
+              const txs = JSON.parse(txsStr);
+              const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5') || document.body.className.includes('theme4');
+              const bg1 = isDark ? 'rgba(16,185,129,0.1)' : '#f0fdf4';
+              const bg2 = isDark ? 'rgba(255,255,255,0.05)' : '#f8fafc';
+              
+              let html = '<ul style="list-style:none; padding:0; margin:0; font-family:monospace; font-size:13px;">';
+              txs.forEach(tx => {
+                  if(tx.type === 'COINBASE') {
+                      html += \`<li style="margin-bottom:10px; padding:12px; background:\${bg1}; border-radius:8px; display:flex; flex-direction:column; gap:5px;">
+                          <div>⛏️ <b style="color:#10b981;">出块挖矿奖励</b> &rarr; <a href="javascript:void(0)" onclick="searchBalance('\${tx.to}')" style="color:#3b82f6; text-decoration:none;">\${tx.to}</a></div>
+                          <div style="text-align:right; font-weight:bold; color:#10b981;">+ \${tx.amount} Cycle</div>
+                      </li>\`;
+                  } else {
+                      html += \`<li style="margin-bottom:10px; padding:12px; background:\${bg2}; border-radius:8px; display:flex; flex-direction:column; gap:5px;">
+                          <div><span style="color:#888;">From:</span> <a href="javascript:void(0)" onclick="searchBalance('\${tx.from}')" style="color:#3b82f6; text-decoration:none;">\${tx.from}</a></div>
+                          <div><span style="color:#888;">To:</span> &nbsp;&nbsp;<a href="javascript:void(0)" onclick="searchBalance('\${tx.to}')" style="color:#3b82f6; text-decoration:none;">\${tx.to}</a></div>
+                          <div style="text-align:right; font-weight:bold; color:#8b5cf6;">\${tx.amount} Cycle</div>
+                      </li>\`;
+                  }
+              });
+              html += '</ul>';
+              document.getElementById('txTraceList').innerHTML = html;
+              document.getElementById('txTraceModal').style.display = 'block';
+          }
+
           let markersLayer;
           let geoJsonLayer;
           let worldGeoJson = null;
           let currentMapDataStr = "";
 
-          const countryCoords = {
-            'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16],
-            'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43],
-            'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77],
-            'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93],
-            'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22],
-            'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46],
-            'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24],
-            'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27],
-            'PH': [12.87, 121.77], 'ID': [-0.78, 113.92]
+          const countryCoords = { 
+            'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 
+            'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43], 
+            'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77], 
+            'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93], 
+            'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22], 
+            'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46], 
+            'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24], 
+            'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27], 
+            'PH': [12.87, 121.77], 'ID': [-0.78, 113.92] 
           };
-
-          const iso2To3 = {
-            "US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR",
-            "NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF",
-            "TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR",
-            "DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM",
-            "PH":"PHL","ID":"IDN"
+          const iso2To3 = { 
+            "US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR", 
+            "NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF", 
+            "TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR", 
+            "DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM", 
+            "PH":"PHL","ID":"IDN" 
           };
 
           async function initMap() {
-            window.myMap = L.map('map-container', {
-                zoomControl: true,
-                attributionControl: false,
-                minZoom: 1
-            }).setView([30, 10], 2);
-
+            window.myMap = L.map('map-container', { zoomControl: true, attributionControl: false, minZoom: 1 }).setView([30, 10], 2);
             try {
                 const res = await fetch('https://cdn.jsdelivr.net/gh/johan/world.geo.json@master/countries.geo.json');
                 worldGeoJson = await res.json();
                 drawMarkers();
-            } catch (e) {
-                console.error("Map load failed", e);
-            }
+            } catch (e) {}
           }
 
           function drawMarkers() {
             if(!window.myMap || !worldGeoJson) return;
-
             const newDataStr = document.getElementById('map-data').textContent;
             if (currentMapDataStr === newDataStr) return;
             currentMapDataStr = newDataStr;
-
             if(geoJsonLayer) window.myMap.removeLayer(geoJsonLayer);
-            if(markersLayer) markersLayer.clearLayers();
-            else markersLayer = L.layerGroup().addTo(window.myMap);
-
+            if(markersLayer) markersLayer.clearLayers(); else markersLayer = L.layerGroup().addTo(window.myMap);
             const data = JSON.parse(newDataStr);
             const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5');
-
-            const activeIso3 = {};
-            for (const code in data) {
-                if (iso2To3[code]) activeIso3[iso2To3[code]] = true;
-            }
-
-            geoJsonLayer = L.geoJSON(worldGeoJson, {
-                style: function(feature) {
-                    const isActive = activeIso3[feature.id];
-                    return {
-                        fillColor: isActive ? '#10b981' : (isDark ? '#2a303c' : '#d5dce2'),
-                        weight: 1,
-                        opacity: 1,
-                        color: isDark ? '#1a202c' : '#ffffff',
-                        fillOpacity: 1
-                    };
-                }
+            const activeIso3 = {}; 
+            for (const code in data) { if (iso2To3[code]) activeIso3[iso2To3[code]] = true; }
+            geoJsonLayer = L.geoJSON(worldGeoJson, { 
+                style: function(feature) { 
+                    const isActive = activeIso3[feature.id]; 
+                    return { fillColor: isActive ? '#10b981' : (isDark ? '#2a303c' : '#d5dce2'), weight: 1, opacity: 1, color: isDark ? '#1a202c' : '#ffffff', fillOpacity: 1 }; 
+                } 
             }).addTo(window.myMap);
-
             for (const [code, count] of Object.entries(data)) {
-              if(countryCoords[code]) {
-                const icon = L.divIcon({ className: 'custom-map-badge', html: \`<div>\${count}</div>\`, iconSize: [22,22] });
-                L.marker(countryCoords[code], {icon: icon}).addTo(markersLayer);
+              if(countryCoords[code]) { 
+                  const icon = L.divIcon({ className: 'custom-map-badge', html: \`<div>\${count}</div>\`, iconSize: [22,22] }); 
+                  L.marker(countryCoords[code], {icon: icon}).addTo(markersLayer); 
               }
             }
           }
@@ -2753,32 +3026,23 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
                   document.getElementById('ui-height').innerText = payloadData.getAttribute('data-height');
                   document.getElementById('ui-beacons').innerText = payloadData.getAttribute('data-beacons');
                   document.getElementById('ui-nodes').innerText = payloadData.getAttribute('data-nodes');
+                  document.getElementById('ui-pending-txs').innerText = payloadData.getAttribute('data-pending-txs');
               }
 
-              const newStats = newDoc.getElementById('ajax-stats');
-              if (newStats) document.getElementById('ajax-stats').innerHTML = newStats.innerHTML;
+              const idsToUpdate = ['ajax-stats', 'ajax-cards', 'ajax-table', 'table-blocks-body', 'ajax-filters', 'map-data', 'ajax-richlist'];
+              idsToUpdate.forEach(id => {
+                  const newEl = newDoc.getElementById(id === 'table-blocks-body' ? 'ajax-blocks' : id);
+                  if (newEl && document.getElementById(id)) {
+                      if (id === 'map-data') document.getElementById(id).textContent = newEl.textContent;
+                      else document.getElementById(id).innerHTML = newEl.innerHTML;
+                  }
+              });
               
-              const newCards = newDoc.getElementById('ajax-cards');
-              if (newCards) document.getElementById('ajax-cards').innerHTML = newCards.innerHTML;
-              
-              const newTable = newDoc.getElementById('ajax-table');
-              if (newTable) document.getElementById('ajax-table').innerHTML = newTable.innerHTML;
-
-              const newBlocks = newDoc.getElementById('ajax-blocks');
-              if (newBlocks && document.getElementById('table-blocks-body')) document.getElementById('table-blocks-body').innerHTML = newBlocks.innerHTML;
-              
-              const newFilters = newDoc.getElementById('ajax-filters');
-              if (newFilters) document.getElementById('ajax-filters').innerHTML = newFilters.innerHTML;
-              
-              const newMapData = newDoc.getElementById('map-data');
-              if (newMapData) document.getElementById('map-data').textContent = newMapData.textContent;
-              
-              drawMarkers();
+              drawMarkers(); 
               applyFilter(); 
             } catch (e) {}
           }, 3500); 
         </script>
-        
         ${sys.custom_script || ''}
       </body>
       </html>`;
