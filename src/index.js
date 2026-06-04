@@ -20,7 +20,7 @@ export default {
     const host = url.origin;
     
     // ==========================================
-    // 0. 数据库自动化热创建 (优化版：引入创世版本防踩踏栅栏)
+    // 0. 数据库自动化热创建与终极索引初始化
     // ==========================================
     let isDbReady = globalThis.dbInitialized;
     if (!isDbReady) {
@@ -146,6 +146,18 @@ export default {
 
         try { await env.DB.prepare(`DROP TABLE IF EXISTS executed_txs`).run(); } catch(e) {}
 
+        // 🚀 核心优化 1：D1 数据库高性能索引初始化 (防御全表扫描)
+        try {
+            await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_servers_visibility_updated ON servers (is_hidden, last_updated)`).run();
+            await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ledger_status_slot ON blockchain_ledger (status, slot_id DESC)`).run();
+            await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ledger_sync ON blockchain_ledger (slot_id ASC)`).run();
+            await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_peers_beacon_last_seen ON blockchain_peers (is_beacon, last_seen DESC, total_asset DESC)`).run();
+            await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_mempool_sort ON mempool (timestamp ASC, tx_id ASC)`).run();
+            await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_wallets_balance ON blockchain_wallets (balance DESC)`).run();
+        } catch(e) {
+            // 静默处理由于版本冲突可能产生的索引创建异常
+        }
+
         const forceSync = await env.DB.prepare(`SELECT value FROM settings WHERE key='force_sync_${PROTOCOL_VERSION}'`).first();
         if (!forceSync) {
             await env.DB.prepare("DELETE FROM blockchain_ledger").run();
@@ -199,7 +211,6 @@ export default {
       } catch (e) {}
     }
 
-    // 🚀 核心优化 1：引入全局内存缓存，避免所有路由频繁读取 Settings 表
     let sys = {
       site_title: '⚡ Server Monitor Pro', admin_title: '⚙️ 探针管理后台',
       theme: 'theme1', custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
@@ -326,7 +337,6 @@ export default {
       return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     };
 
-    // 🚀 核心优化 2：计算与存储分离。独立出资产查询到内存，供后续共识打包时极速读取。
     const calcServerAsset = (server, nowMs) => {
         let amount = 0; let remValue = 0;
         try {
@@ -373,7 +383,6 @@ export default {
         return { amount: amount || 0, remValue: remValue || 0 };
     };
 
-    // 🚀 核心优化 2.1：利用后台任务定期更新全量缓存资产，避免阻塞主线程
     const refreshGlobalAssetCache = async () => {
         const now = Date.now();
         if (!globalThis.lastAssetCacheTime || now - globalThis.lastAssetCacheTime > 60000) {
@@ -804,7 +813,6 @@ export default {
                 let allStmts = [];
                 allStmts.push(env.DB.prepare(`INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`).bind(block.slot_id, block.proposer_domain, block.block_hash, block.parent_hash, block.payload, block.timestamp || getNetworkTime(), blockDifficulty));
                 
-                // 🚀 异步化 Peer 更新，剥离不必要的强一致性锁
                 ctx.waitUntil(env.DB.prepare(`
                     INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, wallet_address) 
                     VALUES (?, 'true', ?, ?, ?, ?) 
@@ -879,7 +887,6 @@ export default {
                 return;
             }
 
-            // 🚀 核心优化 3：剔除每次出块时的全表遍历查询，直接复用前置缓存好的内存参数
             let localAsset = globalThis.cachedTotalAsset || 0;
             let localVpsCount = globalThis.cachedVpsCount || 0;
 
@@ -925,7 +932,6 @@ export default {
                 return;
             }
 
-            // 🚀 核心优化 4：异步写入 Peer 自己上报的重力，避免锁死当前出块流水线
             ctx.waitUntil(env.DB.prepare(`
                 INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score, wallet_address)
                 VALUES (?, ?, ?, ?, ?, 9999, ?)
@@ -2034,8 +2040,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
     // ==========================================
     if (request.method === 'POST' && url.pathname === '/update') {
       try {
-        // 🚀 核心优化 5：黑科技！通过 Cache API 将 POST 拦截成 GET 边缘防抖
-        // 当多台 VPS 或由于网络抖动引发并发 POST 上报时，将其伪装成带时间窗的 GET 请求丢给 Cloudflare Edge 缓存
         const clonedReq = request.clone();
         let data;
         try {
@@ -2047,7 +2051,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         const { id, secret, metrics, type } = data;
         if (secret !== env.API_SECRET) return new Response('Unauthorized', { status: 401 });
 
-        // 设置防抖时间窗（例如：15 秒为一个桶，避免同一 ID 15秒内重复写 D1）
         const timeWindow = Math.floor(Date.now() / 15000);
         const cacheUrl = new URL(request.url);
         cacheUrl.pathname = `/update-cache/${id}/${timeWindow}`;
@@ -2056,7 +2059,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
 
         let cachedRes = await cache.match(cacheReq);
         if (cachedRes) {
-            // 命中边缘/内存缓存！直接阻断，不消耗后续任何 D1 额度
             return cachedRes;
         }
 
@@ -2070,7 +2072,8 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX';
         if (countryCode.toUpperCase() === 'TW') countryCode = 'CN';
 
-        const serverExists = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+        // 🚀 核心优化 2：杜绝 SELECT * 全表拉取，严格限定读取字段，极大减少 D1 出口带宽与内存撑爆风险
+        const serverExists = await env.DB.prepare('SELECT id, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, hist_updated, history FROM servers WHERE id = ?').bind(id).first();
         if (!serverExists) return new Response('Server not found', { status: 404 });
 
         const nowTime = new Date();
@@ -2391,9 +2394,15 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
           let otherAssets = 0;
           
           let walletBalances = {};
+          // 🚀 核心优化 3：剔除全表遍历钱包。仅针对活跃排行版的 Peer 钱包执行靶向 IN 查询。
           try {
-              const { results: wBals } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
-              wBals.forEach(w => walletBalances[w.address] = w.balance);
+              const activeWallets = rankList.map(p => p.wallet_address).filter(w => w);
+              if (activeWallets.length > 0) {
+                  const uniqueWallets = [...new Set(activeWallets)];
+                  const placeholders = uniqueWallets.map(() => '?').join(',');
+                  const { results: wBals } = await env.DB.prepare(`SELECT address, balance FROM blockchain_wallets WHERE address IN (${placeholders})`).bind(...uniqueWallets).all();
+                  if (wBals) wBals.forEach(w => walletBalances[w.address] = w.balance);
+              }
           } catch(e) {}
 
           let sortedPeers = [...rankList];
@@ -2760,7 +2769,7 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
               });
               drawMarkers(); applyFilter(); 
             } catch (e) {}
-          }, 30000); // 🚀 核心优化 8：降低前端 Ajax 轮询频率，从 15s 降至 30s
+          }, 30000); 
         </script>
         ${sys.custom_script || ''}
       </body>
