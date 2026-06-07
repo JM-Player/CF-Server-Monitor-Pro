@@ -90,7 +90,8 @@ export default {
       is_public: 'true', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true', show_admin_btn: 'true',
       admin_path: '/admin', asset_currency: '元', seed_nodes: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
       auto_reset_traffic: 'false', report_interval: '5', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
-      offline_threshold: '30', alert_threshold: '120'
+      offline_threshold: '30', alert_threshold: '120',
+      enable_popup: 'false', popup_content: '<h3>📢 公告</h3><p>欢迎来到 Server Monitor Pro！<br>这是自定义弹窗内容，支持 HTML 排版。</p>'
     };
 
     try {
@@ -356,8 +357,8 @@ export default {
                 inline_keyboard: [
                     [{text: `${sys.is_public === 'true' ? '✅' : '❌'} 公开访问`, callback_data: 'cb_toggle_is_public'}, {text: `${sys.show_price === 'true' ? '✅' : '❌'} 显示价格`, callback_data: 'cb_toggle_show_price'}],
                     [{text: `${sys.show_expire === 'true' ? '✅' : '❌'} 显示到期`, callback_data: 'cb_toggle_show_expire'}, {text: `${sys.show_bw === 'true' ? '✅' : '❌'} 显示带宽`, callback_data: 'cb_toggle_show_bw'}],
-                    [{text: `${sys.show_tf === 'true' ? '✅' : '❌'} 显示流量`, callback_data: 'cb_toggle_show_tf'}, {text: `${sys.auto_reset_traffic === 'true' ? '✅' : '❌'} 流量按期重置`, callback_data: 'cb_toggle_auto_reset_traffic'}],
-                    [{text: '🔙 返回主菜单', callback_data: 'cb_menu'}]
+                    [{text: `${sys.show_tf === 'true' ? '✅' : '❌'} 显示流量`, callback_data: 'cb_toggle_show_tf'}, {text: `${sys.auto_reset_traffic === 'true' ? '✅' : '❌'} 流量重置`, callback_data: 'cb_toggle_auto_reset_traffic'}],
+                    [{text: `${sys.enable_popup === 'true' ? '✅' : '❌'} 首页弹窗`, callback_data: 'cb_toggle_enable_popup'}, {text: '🔙 返回主菜单', callback_data: 'cb_menu'}]
                 ]
             };
         };
@@ -756,6 +757,17 @@ export default {
                 <label>⏱️ TG掉线告警阈值 (秒)</label>
                 <input type="number" id="cfg_alert_threshold" value="${sys.alert_threshold || '120'}" min="10" placeholder="默认 120 秒 (即超过多少秒不报才推TG)">
               </div>
+              
+              <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #d97706;">📢 首页弹窗公告设置</label>
+              <div class="checkbox-group">
+                <input type="checkbox" id="cfg_enable_popup" ${sys.enable_popup === 'true' ? 'checked' : ''} onchange="document.getElementById('popup_content_group').style.display = this.checked ? 'block' : 'none'">
+                <label for="cfg_enable_popup"><b>开启访客首次访问弹窗</b> (按IP和浏览器缓存控制)</label>
+              </div>
+              <div class="form-group" id="popup_content_group" style="display: ${sys.enable_popup === 'true' ? 'block' : 'none'}; margin-top: 10px;">
+                <label>📝 弹窗显示内容 (支持 HTML)</label>
+                <textarea id="cfg_popup_content" rows="5" placeholder="<h3>公告</h3><p>自定义内容...</p>">${sys.popup_content || ''}</textarea>
+              </div>
             </div>
             <div>
               <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #555;">👁️ 前台展示控制</label>
@@ -930,6 +942,8 @@ export default {
                 report_interval: document.getElementById('cfg_report_interval').value || '5',
                 offline_threshold: document.getElementById('cfg_offline_threshold').value || '30',
                 alert_threshold: document.getElementById('cfg_alert_threshold').value || '120',
+                enable_popup: document.getElementById('cfg_enable_popup').checked ? 'true' : 'false',
+                popup_content: document.getElementById('cfg_popup_content').value,
                 ping_node_ct: document.getElementById('cfg_ping_node_ct').value,
                 ping_node_cu: document.getElementById('cfg_ping_node_cu').value,
                 ping_node_cm: document.getElementById('cfg_ping_node_cm').value
@@ -1714,6 +1728,7 @@ rm -f /tmp/cf_install.sh
     if (request.method === 'GET' && url.pathname === '/') {
       if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
 
+      const clientIP = request.headers.get('cf-connecting-ip') || request.headers.get('x-real-ip') || 'unknown';
       const isAjax = url.searchParams.get('ajax') === '1';
       const idParam = url.searchParams.get('id');
 
@@ -2324,6 +2339,32 @@ rm -f /tmp/cf_install.sh
                <div style="text-align:right; margin-top:20px;"><button onclick="closeRankModal()" class="btn btn-gray" style="padding: 8px 20px;">关闭</button></div>
             </div>
           </div>
+          
+          ${sys.enable_popup === 'true' ? `
+          <div id="welcome-popup" class="modal" style="z-index: 9999;">
+            <div class="modal-content" style="max-width: 550px; padding: 30px; text-align: center; border-radius: 16px;">
+              <div style="text-align: left; line-height: 1.6; font-size: 15px; color: inherit; max-height: 60vh; overflow-y: auto; padding-right: 5px;">
+                  ${sys.popup_content || ''}
+              </div>
+              <div style="margin-top: 25px; text-align: center;">
+                <button onclick="closeWelcomePopup()" class="btn btn-blue" style="padding: 10px 30px; font-size: 16px; border-radius: 8px;">我已知晓</button>
+              </div>
+            </div>
+          </div>
+          <script>
+            document.addEventListener('DOMContentLoaded', () => {
+              const currentIP = "${clientIP}";
+              const lastSeenIP = localStorage.getItem('popup_seen_ip');
+              if (lastSeenIP !== currentIP) {
+                 document.getElementById('welcome-popup').style.display = 'block';
+              }
+            });
+            function closeWelcomePopup() {
+              localStorage.setItem('popup_seen_ip', "${clientIP}");
+              document.getElementById('welcome-popup').style.display = 'none';
+            }
+          </script>
+          ` : ''}
           
           ${getFooterHtml(sys)}
         </div>
