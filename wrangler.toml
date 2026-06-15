@@ -1,4 +1,4 @@
-name = "tanzhen"
+name = "server-monitor-pro"
 main = "src/index.js"
 compatibility_date = "2026-06-05"
 
